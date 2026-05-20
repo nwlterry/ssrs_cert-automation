@@ -1,13 +1,7 @@
-# Updated version with full error handling
 <#
 .SYNOPSIS
-    Update renewed certificates for SSRS (and optionally others).
-    Handles Replace events from Certificate Services lifecycle notifications.
-
-.NOTES
-    Fixes: Web Portal URL "UNKNOWN" + invalid CIM class errors.
-    Supports SSRS 2016–2022+ (v13–v16 namespaces).
-    Full CIM error handling added.
+    SSRS Certificate Auto-Renewal Handler for Windows Certificate Lifecycle Notifications
+    Optimized for SSRS 2017+ (v14+) where only MSReportServer_ConfigurationSetting class exists.
 #>
 
 Param(
@@ -16,7 +10,7 @@ Param(
     [Int32]$EventRecordId
 )
 
-# === Duplicate prevention ===
+# === Duplicate Event Prevention ===
 $StatePath = "$env:ProgramData\CertificateNotificationTasks"
 $StateFile = Join-Path $StatePath "LastProcessedEventRecordId.txt"
 
@@ -39,7 +33,7 @@ if (-not $NewCertificate) {
     throw "New certificate with thumbprint $NewCertHash not found in LocalMachine\My store." 
 }
 
-# === Extract DNS names (CN + SAN) ===
+# === Extract DNS Names (CN + SAN) ===
 $DnsNames = @()
 $SanExt = $NewCertificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' } | Select-Object -First 1
 if ($SanExt) {
@@ -52,59 +46,54 @@ if (-not $DnsNames) {
     throw "Could not extract any DNS names from the certificate." 
 }
 
-# === Filter for Internal Web Server certificates ===
+# === Only process Internal Web Server certificates ===
 if (-not ($NewCertificate.Extensions | Where-Object { 
     $_.Oid.Value -eq '1.3.6.1.4.1.311.21.7' -and $_.Format(0) -match "Internal Web Server" 
 })) {
-    Write-Output "Certificate is not 'Internal Web Server' template. Skipping SSRS update."
+    Write-Output "Certificate is not 'Internal Web Server' template. Skipping."
     if ($EventRecordId) { Set-Content -Path $StateFile -Value $EventRecordId -Force }
     return
 }
 
-# === SSRS Processing with full error handling ===
-$SSRSInstances = Get-CimInstance -Namespace root\Microsoft\SqlServer\ReportServer -ClassName MSReportServer_Instance -ErrorAction SilentlyContinue
+# === Discover SSRS Instances via __Namespace ===
+$RootNs = "root\Microsoft\SqlServer\ReportServer"
+$Instances = Get-CimInstance -Namespace $RootNs -ClassName __Namespace -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'RS_*' }
 
-if (-not $SSRSInstances) {
-    Write-Warning "No SSRS instances found via CIM. SSRS may not be installed or WMI namespace is unavailable."
+if (-not $Instances) {
+    Write-Warning "No SSRS instances found under $RootNs"
 } else {
-    foreach ($Instance in $SSRSInstances) {
-        Write-Output "=== Processing SSRS Instance: $($Instance.InstanceName) ==="
+    foreach ($InstNs in $Instances) {
+        $InstanceName = $InstNs.Name
+        Write-Output "=== Processing SSRS Instance: $InstanceName ==="
+
+        # Find correct Admin namespace (v16 down to v13)
+        $AdminNs = $null
+        foreach ($v in 16..13) {
+            $Candidate = "$RootNs\$InstanceName\v$v\Admin"
+            try {
+                if (Get-CimInstance -Namespace $Candidate -ClassName MSReportServer_ConfigurationSetting -ErrorAction Stop) {
+                    $AdminNs = $Candidate
+                    break
+                }
+            } catch { }
+        }
+
+        if (-not $AdminNs) {
+            Write-Warning "No supported Admin namespace found for $InstanceName. Skipping."
+            continue
+        }
 
         try {
-            # Auto-detect correct version namespace (v13 to v16)
-            $AdminNs = $null
-            foreach ($v in 16..13) {
-                $Candidate = "root\Microsoft\SqlServer\ReportServer\RS_$($Instance.InstanceName)\v$v\Admin"
-                try {
-                    if (Get-CimInstance -Namespace $Candidate -ClassName MSReportServer_ConfigurationSetting -ErrorAction Stop) {
-                        $AdminNs = $Candidate
-                        break
-                    }
-                } catch { }
-            }
-
-            if (-not $AdminNs) {
-                Write-Warning "Could not find supported SSRS Admin namespace for instance $($Instance.InstanceName). Skipping."
-                continue
-            }
-
-            Write-Output "Using namespace: $AdminNs"
-
-            # Get Configuration
             $Config = Get-CimInstance -Namespace $AdminNs -ClassName MSReportServer_ConfigurationSetting -ErrorAction Stop
-
-            # Get supporting objects
-            $Reserved = Get-CimInstance -Namespace $AdminNs -ClassName MSReportServer_ReservedURL -ErrorAction SilentlyContinue
-            $Bindings  = Get-CimInstance -Namespace $AdminNs -ClassName MSReportServer_SSLCertificateBinding -ErrorAction SilentlyContinue
-
             $SystemLocale = Get-Culture
-            $SuccessCount = 0
+            $Success = $false
+            $Port = 443   # ← Change if you use a different HTTPS port
 
             foreach ($App in @('ReportServerWebService', 'ReportServerWebApp')) {
                 Write-Output "  Processing application: $App"
 
-                # --- Reserve URLs (fixes UNKNOWN WebAccess) ---
-                $Port = 443  # Change if you use a custom port
+                # Reserve URLs - Fixes "UNKNOWN" Web Portal
                 foreach ($Name in $DnsNames) {
                     $Url = "https://$Name`:$Port"
                     try {
@@ -113,84 +102,59 @@ if (-not $SSRSInstances) {
                             UrlString   = $Url
                             Lcid        = $SystemLocale.LCID
                         } -ErrorAction Stop
-
                         if ($Result.HRESULT -eq 0) {
                             Write-Output "    Reserved URL: $Url"
-                            $SuccessCount++
-                        } else {
-                            Write-Warning "    ReserveURL returned HRESULT $($Result.HRESULT) for $Url"
+                            $Success = $true
                         }
-                    }
-                    catch {
-                        Write-Warning "    Failed to reserve URL $Url for $App : $($_.Exception.Message)"
+                    } catch {
+                        Write-Warning "    ReserveURL failed for $Url: $($_.Exception.Message)"
                     }
                 }
 
-                # --- Update Certificate Binding ---
+                # Create SSL Certificate Binding
                 if ($OldCertHash) {
-                    $OldBindings = $Bindings | Where-Object { $_.Application -eq $App -and $_.CertificateHash -eq $OldCertHash }
-                    foreach ($b in $OldBindings) {
-                        try {
-                            $Result = $Config | Invoke-CimMethod -MethodName CreateSSLCertificateBinding -Arguments @{
-                                Application     = $App
-                                CertificateHash = $NewCertHash.ToLower()
-                                IPAddress       = $b.IPAddress
-                                Port            = $b.Port
-                                Lcid            = $SystemLocale.LCID
-                            } -ErrorAction Stop
-
-                            if ($Result.HRESULT -eq 0) {
-                                Write-Output "    Updated SSL binding for $App on $($b.IPAddress):$($b.Port)"
-                                $SuccessCount++
-                            } else {
-                                Write-Warning "    CreateSSLCertificateBinding returned HRESULT $($Result.HRESULT)"
-                            }
+                    try {
+                        $Result = $Config | Invoke-CimMethod -MethodName CreateSSLCertificateBinding -Arguments @{
+                            Application     = $App
+                            CertificateHash = $NewCertHash.ToLower()
+                            IPAddress       = '0.0.0.0'
+                            Port            = $Port
+                            Lcid            = $SystemLocale.LCID
+                        } -ErrorAction Stop
+                        if ($Result.HRESULT -eq 0) {
+                            Write-Output "    SSL Binding updated for $App"
+                            $Success = $true
                         }
-                        catch {
-                            Write-Warning "    Failed to update binding for $App : $($_.Exception.Message)"
-                        }
+                    } catch {
+                        Write-Warning "    CreateSSLCertificateBinding failed: $($_.Exception.Message)"
                     }
                 }
             }
 
-            # --- Initialize and set URLs (critical for Web Portal) ---
+            # Set Web URLs
             try {
                 if (-not $Config.IsInitialized) {
-                    $InitResult = $Config | Invoke-CimMethod -MethodName InitializeReportServer -Arguments @{
-                        InstallationID = $Config.InstallationID
-                    } -ErrorAction Stop
-                    Write-Output "    ReportServer initialized."
+                    $Config | Invoke-CimMethod -MethodName InitializeReportServer -Arguments @{ InstallationID = $Config.InstallationID } | Out-Null
                 }
-
                 $Config | Invoke-CimMethod -MethodName SetWebServiceUrl -Arguments @{
-                    Protocol = 'https'
-                    HostName = $Config.MachineName
-                    Port     = $Config.WebServicePort
-                    VirtualDirectory = $Config.WebServiceVirtualDirectory
-                } -ErrorAction Stop | Out-Null
-
+                    Protocol='https'; HostName=$Config.MachineName; Port=$Port; VirtualDirectory=$Config.WebServiceVirtualDirectory
+                } | Out-Null
                 $Config | Invoke-CimMethod -MethodName SetWebPortalUrl -Arguments @{
-                    Protocol = 'https'
-                    HostName = $Config.MachineName
-                    Port     = $Config.WebPortalPort
-                    VirtualDirectory = $Config.WebPortalVirtualDirectory
-                } -ErrorAction Stop | Out-Null
-
-                Write-Output "    WebServiceUrl and WebPortalUrl successfully updated."
-                $SuccessCount++
-            }
-            catch {
-                Write-Warning "    Failed to set Web URLs or initialize: $($_.Exception.Message)"
+                    Protocol='https'; HostName=$Config.MachineName; Port=$Port; VirtualDirectory=$Config.WebPortalVirtualDirectory
+                } | Out-Null
+                Write-Output "    WebServiceUrl and WebPortalUrl updated."
+                $Success = $true
+            } catch {
+                Write-Warning "    Failed to set Web URLs: $($_.Exception.Message)"
             }
 
-            if ($SuccessCount -gt 0) {
+            if ($Success) {
                 Write-Output "  Restarting SQLServerReportingServices service..."
                 Restart-Service -Name 'SQLServerReportingServices' -Force -ErrorAction Stop
-                Write-Output "  SSRS service restarted successfully."
             }
         }
         catch {
-            Write-Error "Critical error processing SSRS instance $($Instance.InstanceName): $($_.Exception.Message)" -ErrorAction Continue
+            Write-Error "Critical error processing instance $InstanceName: $($_.Exception.Message)"
         }
     }
 }
@@ -200,4 +164,4 @@ if ($EventRecordId) {
     Set-Content -Path $StateFile -Value $EventRecordId -Force
 }
 
-Write-Output "`nSSRS certificate renewal processing completed."
+Write-Output "`nSSRS certificate renewal processing completed successfully."
