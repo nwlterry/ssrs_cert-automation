@@ -1,34 +1,44 @@
 # SSRS Certificate Auto-Renewal Automation
 
-This repository is a **fork/specialized version** of [Borgquite/CertificateNotificationTasks](https://github.com/Borgquite/CertificateNotificationTasks) focused on **SQL Server Reporting Services (SSRS)** certificate auto-renewal.
+PowerShell solution to automatically renew **SQL Server Reporting Services (SSRS)** certificates using Windows Certificate Services Lifecycle Notifications.
 
 ## Origin
-- Base scripts come from: https://github.com/Borgquite/CertificateNotificationTasks
-- `Update-RenewedSystemCertificates_Original.ps1` = Original unmodified script from the above repository (used by `Deploy-CertificateRenewalTasks.ps1`)
+Specialized fork of [Borgquite/CertificateNotificationTasks](https://github.com/Borgquite/CertificateNotificationTasks) for SSRS environments.
+
+- `Update-RenewedSystemCertificates_Original.ps1` = Original unmodified script from the base repository.
 
 ## Current Status
-**Working Versions for this environment:**
+**Recommended working versions:**
 - **`Update-RenewedSystemCertificates_V5.ps1`** → **Recommended** (Common Name + SAN)
 - **`Update-RenewedSystemCertificates_V6.ps1`** → Common Name only
 
-Original version is kept for reference only.
+## SQL Server / SSRS Version Reference
+
+| SSRS Version          | SQL Server Version | WMI Namespace Version | Namespace Example                                      | CIM Class Used                     |
+|-----------------------|--------------------|-----------------------|--------------------------------------------------------|------------------------------------|
+| SSRS 2016             | SQL 2016           | v13                   | `root\Microsoft\SqlServer\ReportServer\RS_SSRS\v13\Admin` | MSReportServer_ConfigurationSetting |
+| **SSRS 2017**         | **SQL 2017**       | **v14**               | `root\Microsoft\SqlServer\ReportServer\RS_SSRS\v14\Admin` | MSReportServer_ConfigurationSetting |
+| SSRS 2019             | SQL 2019           | v15                   | `root\Microsoft\SqlServer\ReportServer\RS_SSRS\v15\Admin` | MSReportServer_ConfigurationSetting |
+| SSRS 2022+            | SQL 2022+          | v16                   | `root\Microsoft\SqlServer\ReportServer\RS_SSRS\v16\Admin` | MSReportServer_ConfigurationSetting |
+
+> **Your current environment**: SSRS 2017 (v14) with namespace `root\Microsoft\SqlServer\ReportServer\RS_SSRS\V14\Admin`
 
 ## Features
-- Automatic trigger on certificate **Replace** events for "Internal Web Server" template
+- Triggers on certificate **Replace** events for "Internal Web Server" templates
 - Fixes **Web Portal showing UNKNOWN** after renewal
-- Robust error handling and debug mode
+- Robust CIM error handling + debug mode
 - Duplicate event prevention
-- Re-reserves HTTPS URLs and updates SSL bindings
+- Automatic URL re-reservation and SSL binding updates
 
 ## Files
 
 | File                                              | Description                                      | Status                  |
 |---------------------------------------------------|--------------------------------------------------|-------------------------|
 | `Deploy-CertificateRenewalTasks.ps1`              | Deploys the certificate notification task        | Active                  |
-| `Update-RenewedSystemCertificates_V5.ps1`         | **Recommended** – CN + SAN support               | **Last Working**        |
-| `Update-RenewedSystemCertificates_V6.ps1`         | Common Name only                                 | **Last Working**        |
+| `Update-RenewedSystemCertificates_V5.ps1`         | **Recommended** – CN + SAN                       | **Working**             |
+| `Update-RenewedSystemCertificates_V6.ps1`         | Common Name only                                 | **Working**             |
 | `Update-RenewedSystemCertificates_Original.ps1`   | Original script from Borgquite repo              | Reference only          |
-| V1–V4                                             | Historical / testing versions                    | Archive                 |
+| V1–V4                                             | Historical versions                              | Archive                 |
 
 ## Deployment
 
@@ -41,7 +51,7 @@ Original version is kept for reference only.
 ## Manual Testing
 
 ```powershell
-# Recommended - V5 (Common Name + SAN)
+# Recommended - V5 (CN + SAN)
 .\Update-RenewedSystemCertificates_V5.ps1 -NewCertHash "YOUR_NEW_THUMBPRINT" -OldCertHash "YOUR_OLD_THUMBPRINT" -DebugMode
 
 # Alternative - V6
@@ -49,8 +59,8 @@ Original version is kept for reference only.
 ```
 
 ## Troubleshooting
-- Run with `-DebugMode` for detailed CIM/namespace output.
-- Verify SSRS configuration class:
+- Run with `-DebugMode` for detailed CIM output.
+- Verify your namespace:
   ```powershell
   Get-CimInstance -Namespace "root\Microsoft\SqlServer\ReportServer\RS_SSRS\V14\Admin" -ClassName MSReportServer_ConfigurationSetting
   ```
