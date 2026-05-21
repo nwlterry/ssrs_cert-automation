@@ -12,7 +12,6 @@ PowerShell solution to automatically renew SSRS certificates using Windows Certi
 ## Files
 | File | Description | Status |
 |------|-------------|--------|
-| `Update-RenewedSystemCertificates.ps1` | **Current recommended (V5)** | Active |
 | `Update-RenewedSystemCertificates_V5.ps1` | Common Name + SAN | Stable / Working |
 | `Update-RenewedSystemCertificates_V6.ps1` | Common Name only | Stable / Working |
 | `Deploy-CertificateRenewalTasks.ps1` | Deployment script | Updated |
