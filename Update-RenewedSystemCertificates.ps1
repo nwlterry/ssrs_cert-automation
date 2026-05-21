@@ -102,4 +102,40 @@ try {
         # Create New SSL Binding 
         try { 
             $Result = $Config | Invoke-CimMethod -MethodName CreateSSLCertificateBinding -Arguments @{ Application = $App; CertificateHash = $NewCertHash.ToLower(); IPAddress = '0.0.0.0'; Port = $Port; Lcid = $SystemLocale.LCID } -ErrorAction Stop 
-            Write-Output "
+            Write-Output "  CreateSSLCertificateBinding (New Cert) → HRESULT: $($Result.HRESULT)" 
+            if ($Result.HRESULT -eq 0) { $Success = $true } 
+        } catch { 
+            Write-Warning "  CreateSSLCertificateBinding failed: $($_.Exception.Message)" 
+        } 
+    }
+
+    # 5. Set Web URLs & Initialize
+    try { 
+        if (-not $Config.IsInitialized) { 
+            Write-Output "Initializing Report Server..." 
+            $Config | Invoke-CimMethod -MethodName InitializeReportServer -Arguments @{ InstallationID = $Config.InstallationID } | Out-Null 
+        } 
+        $Config | Invoke-CimMethod -MethodName SetWebServiceUrl -Arguments @{ Protocol='https'; HostName=$Config.MachineName; Port=$Port; VirtualDirectory=$Config.WebServiceVirtualDirectory } | Out-Null
+        $Config | Invoke-CimMethod -MethodName SetWebPortalUrl -Arguments @{ Protocol='https'; HostName=$Config.MachineName; Port=$Port; VirtualDirectory=$Config.WebPortalVirtualDirectory } | Out-Null
+        
+        Write-Output "✓ WebServiceUrl and WebPortalUrl updated successfully." 
+        $Success = $true 
+    } catch { 
+        Write-Warning "Failed to set Web URLs: $($_.Exception.Message)" 
+    }
+
+    # 6. Restart Service to Apply Bindings
+    if ($Success) { 
+        Write-Output "Restarting SQLServerReportingServices service to apply bindings..." 
+        Restart-Service -Name 'SQLServerReportingServices' -Force 
+        Write-Output "✓ Service restarted successfully." 
+    }
+}
+catch { 
+    Write-Error "Failed to connect or process SSRS configuration: $($_.Exception.Message)" 
+    Write-Output "Please verify the WMI namespace '$AdminNs' is correct on this server."
+}
+
+# Finalize Task Success
+if ($EventRecordId) { Set-Content -Path $StateFile -Value $EventRecordId -Force }
+Write-Output "`nSSRS certificate auto-renewal and rebind processing completed."
