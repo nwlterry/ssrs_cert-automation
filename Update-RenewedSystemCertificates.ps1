@@ -1,13 +1,14 @@
 <#
 .SYNOPSIS 
-    SSRS Certificate Auto-Renewal & Auto-Rebind Handler 
-    Targeted for SSRS Namespace: ROOT\Microsoft\SqlServer\ReportServer\RS_SSRS\V14\Admin
+    Universal SSRS Certificate Auto-Renewal & Auto-Rebind Handler 
+    Supports: SQL Server 2016 - 2025 SSRS & Power BI Report Server (PBIRS)
 #>
 Param( 
     [String]$OldCertHash, 
     [Parameter(Mandatory=$true)][String]$NewCertHash, 
-    [Int32]$EventRecordId, 
-    [switch]$DebugMode = $true
+    [Int32]$EventRecordId,
+    [String]$ExpectedTemplateName, # e.g., "Web Server ( Auto Renew )"
+    [switch]$DebugMode = $false
 )
 
 if ($DebugMode) { Write-Output "=== DEBUG MODE ENABLED ===" }
@@ -25,7 +26,7 @@ if ($EventRecordId) {
     }
 }
 
-$OldCertHash = $OldCertHash?.ToUpper()
+$OldCertHash = $OldCertHash.ToUpper()
 $NewCertHash = $NewCertHash.ToUpper()
 
 $NewCertificate = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $NewCertHash }
@@ -44,98 +45,182 @@ if (-not $DnsNames -and $NewCertificate.Subject -match 'CN=([^,]+)') {
 }
 if ($DebugMode) { Write-Output "DNS Names: $($DnsNames -join ', ')" }
 
-# 3. Filter by Certificate Template OID 
-# 1.3.6.1.4.1.311.21.7 is the Certificate Template Information OID.
-$certTemplateExtension = $NewCertificate.Extensions | Where-Object { $_.Oid.Value -eq '1.3.6.1.4.1.311.21.7' }
-
-if (-not $certTemplateExtension) { 
-    Write-Output "No Template Information OID found on certificate. Skipping." 
-    if ($EventRecordId) { Set-Content -Path $StateFile -Value $EventRecordId -Force } 
-    return
-} 
-# Alternatively, if you need to match the specific template name/OID (e.g. "Internal Web Server" OID), 
-# you can parse the raw data. Assuming the script targets specific templates, the above catches the enterprise PKI presence.
-
-# 4. Connect to SSRS WMI Namespace
-$AdminNs = "root\Microsoft\SqlServer\ReportServer\RS_SSRS\V14\Admin"
-$Port = 443
-
-if ($DebugMode) { Write-Output "Using fixed namespace: $AdminNs" }
-
-try { 
-    $Config = Get-CimInstance -Namespace $AdminNs -ClassName MSReportServer_ConfigurationSetting -ErrorAction Stop  
-    if ($DebugMode) { 
-        Write-Output "✓ Successfully connected to ConfigurationSetting" 
-        Write-Output " MachineName   : $($Config.MachineName)" 
-        Write-Output " IsInitialized : $($Config.IsInitialized)" 
-        Write-Output " InstanceName  : $($Config.InstanceName)" 
+# 3. Verify Certificate Template Match (If specified)
+if ($ExpectedTemplateName) {
+    Write-Output "Template verification requested for: '$ExpectedTemplateName'"
+    
+    # 1.3.6.1.4.1.311.21.7 is the V2 Certificate Template Information extension
+    $certTemplateExtension = $NewCertificate.Extensions | Where-Object { $_.Oid.Value -eq '1.3.6.1.4.1.311.21.7' }
+    
+    if (-not $certTemplateExtension) {
+        Write-Output "No Template Information OID found on certificate. Skipping."
+        if ($EventRecordId) { Set-Content -Path $StateFile -Value $EventRecordId -Force }
+        return
     }
 
-    $SystemLocale = Get-Culture 
+    # Extract the exact Enterprise Template OID via Regex
+    $CertTemplateOid = [regex]::Match($certTemplateExtension.Format(0), '1\.3\.6\.1\.4\.1\.311\.21\.8\.[0-9\.]+').Value
+    
+    if ($CertTemplateOid) {
+        if ($DebugMode) { Write-Output "Extracted Template OID from Cert: $CertTemplateOid" }
+        $TemplateMatched = $false
+
+        # Method A: Reliable ADSI Lookup directly against the Configuration Partition
+        try {
+            $RootDSE = [ADSI]"LDAP://RootDSE"
+            $ConfigContext = $RootDSE.configurationNamingContext
+            $Searcher = [adsisearcher]"(&(objectClass=pKICertificateTemplate)(msPKI-Cert-Template-OID=$CertTemplateOid))"
+            $Searcher.SearchRoot = [ADSI]"LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigContext"
+            $Result = $Searcher.FindOne()
+
+            if ($Result) {
+                $ADName = $Result.Properties["name"][0]
+                $ADDisplayName = $Result.Properties["displayname"][0]
+                if ($DebugMode) { Write-Output "Resolved OID in AD to Template: $ADName / $ADDisplayName" }
+
+                if (($ADName -eq $ExpectedTemplateName) -or ($ADDisplayName -eq $ExpectedTemplateName)) {
+                    $TemplateMatched = $true
+                }
+            }
+        } catch {
+            if ($DebugMode) { Write-Warning "ADSI Lookup failed, falling back to local string match." }
+        }
+
+        # Method B: Fallback to local extension text if AD is unreachable
+        if (-not $TemplateMatched) {
+            if ($certTemplateExtension.Format(0) -match [regex]::Escape($ExpectedTemplateName)) {
+                if ($DebugMode) { Write-Output "Matched template name via local extension fallback." }
+                $TemplateMatched = $true
+            }
+        }
+
+        if (-not $TemplateMatched) {
+            Write-Output "Certificate template does not match expected name: '$ExpectedTemplateName'. Skipping."
+            if ($EventRecordId) { Set-Content -Path $StateFile -Value $EventRecordId -Force }
+            return
+        } else {
+            Write-Output "✓ Certificate verified. Matches template: $ExpectedTemplateName"
+        }
+    } else {
+        Write-Output "Could not parse Template OID string from certificate extension. Skipping."
+        if ($EventRecordId) { Set-Content -Path $StateFile -Value $EventRecordId -Force }
+        return
+    }
+}
+
+# 4. Dynamically Discover SSRS / PBIRS WMI Namespaces (2016 - 2025)
+$SsrsConfigs = @()
+$RootNs = "root\Microsoft\SqlServer\ReportServer"
+
+if (Get-CimClass -Namespace $RootNs -ErrorAction SilentlyContinue) {
+    # Find all instances (e.g., RS_SSRS, RS_MSSQLSERVER, PBIRS)
+    $SsrsInstances = Get-CimInstance -Namespace $RootNs -ClassName __NAMESPACE -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+    
+    foreach ($Instance in $SsrsInstances) {
+        # Find all versions under the instance (e.g., V13, V14, V15)
+        $Versions = Get-CimInstance -Namespace "$RootNs\$Instance" -ClassName __NAMESPACE -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+        
+        foreach ($Version in $Versions) {
+            $TargetNs = "$RootNs\$Instance\$Version\Admin"
+            try {
+                $ConfigObj = Get-CimInstance -Namespace $TargetNs -ClassName MSReportServer_ConfigurationSetting -ErrorAction Stop
+                $SsrsConfigs += $ConfigObj
+                if ($DebugMode) { Write-Output "Discovered SSRS Namespace: $TargetNs" }
+            } catch {
+                if ($DebugMode) { Write-Output "No ConfigurationSetting found in $TargetNs" }
+            }
+        }
+    }
+}
+
+if (-not $SsrsConfigs) {
+    Write-Error "No SSRS or PBIRS instances found on this server."
+    return
+}
+
+$Port = 443
+$SystemLocale = Get-Culture 
+
+# 5. Process Each Discovered SSRS Instance
+foreach ($Config in $SsrsConfigs) {
+    Write-Output "`n=== Processing SSRS Instance: $($Config.InstanceName) ==="
+    
+    if ($DebugMode) { 
+        Write-Output " IsInitialized : $($Config.IsInitialized)" 
+        Write-Output " ServiceName   : $($Config.ServiceName)" 
+    }
+
     $Success = $false
 
     foreach ($App in @('ReportServerWebService', 'ReportServerWebApp')) { 
-        Write-Output "Processing application: $App"
+        Write-Output "-> Application: $App"
 
         # Reserve URLs
         foreach ($Name in $DnsNames) { 
             $Url = "https://$Name`:$Port" 
             try { 
                 $Result = $Config | Invoke-CimMethod -MethodName ReserveURL -Arguments @{ Application = $App; UrlString = $Url; Lcid = $SystemLocale.LCID } -ErrorAction Stop 
-                Write-Output "  ReserveURL $Url → HRESULT: $($Result.HRESULT)" 
-                if ($Result.HRESULT -eq 0) { $Success = $true } 
+                
+                if ($Result.HRESULT -eq 0) {
+                    Write-Output "   ReserveURL $Url → Success (0)"
+                    $Success = $true
+                } elseif ($Result.HRESULT -eq -2147220932) {
+                    Write-Output "   ReserveURL $Url → Already Reserved (OK)"
+                    $Success = $true
+                } else {
+                    Write-Output "   ReserveURL $Url → HRESULT: $($Result.HRESULT)"
+                }
             } catch { 
-                Write-Warning "  ReserveURL failed for $Url : $($_.Exception.Message)" 
+                Write-Warning "   ReserveURL failed for $Url : $($_.Exception.Message)" 
             } 
         }
 
-        # Remove Old SSL Binding (SSRS requires removing the old binding before binding a new cert to 0.0.0.0:443)
+        # Remove Old SSL Binding
         if ($OldCertHash) {
             try {
                 $Result = $Config | Invoke-CimMethod -MethodName RemoveSSLCertificateBinding -Arguments @{ Application = $App; CertificateHash = $OldCertHash.ToLower(); IPAddress = '0.0.0.0'; Port = $Port; Lcid = $SystemLocale.LCID } -ErrorAction Stop
-                Write-Output "  RemoveSSLCertificateBinding (Old Cert) → HRESULT: $($Result.HRESULT)"
+                Write-Output "   RemoveSSLCertificateBinding (Old Cert) → HRESULT: $($Result.HRESULT)"
             } catch {
-                Write-Output "  RemoveSSLCertificateBinding: No old binding found or removal failed."
+                Write-Output "   RemoveSSLCertificateBinding: No old binding found or removal failed."
             }
         }
 
         # Create New SSL Binding 
         try { 
             $Result = $Config | Invoke-CimMethod -MethodName CreateSSLCertificateBinding -Arguments @{ Application = $App; CertificateHash = $NewCertHash.ToLower(); IPAddress = '0.0.0.0'; Port = $Port; Lcid = $SystemLocale.LCID } -ErrorAction Stop 
-            Write-Output "  CreateSSLCertificateBinding (New Cert) → HRESULT: $($Result.HRESULT)" 
+            Write-Output "   CreateSSLCertificateBinding (New Cert) → HRESULT: $($Result.HRESULT)" 
             if ($Result.HRESULT -eq 0) { $Success = $true } 
         } catch { 
-            Write-Warning "  CreateSSLCertificateBinding failed: $($_.Exception.Message)" 
+            Write-Warning "   CreateSSLCertificateBinding failed: $($_.Exception.Message)" 
         } 
     }
 
-    # 5. Set Web URLs & Initialize
-    try { 
-        if (-not $Config.IsInitialized) { 
+    # Initialize Server (If necessary)
+    if (-not $Config.IsInitialized) { 
+        try {
             Write-Output "Initializing Report Server..." 
             $Config | Invoke-CimMethod -MethodName InitializeReportServer -Arguments @{ InstallationID = $Config.InstallationID } | Out-Null 
-        } 
-        $Config | Invoke-CimMethod -MethodName SetWebServiceUrl -Arguments @{ Protocol='https'; HostName=$Config.MachineName; Port=$Port; VirtualDirectory=$Config.WebServiceVirtualDirectory } | Out-Null
-        $Config | Invoke-CimMethod -MethodName SetWebPortalUrl -Arguments @{ Protocol='https'; HostName=$Config.MachineName; Port=$Port; VirtualDirectory=$Config.WebPortalVirtualDirectory } | Out-Null
-        
-        Write-Output "✓ WebServiceUrl and WebPortalUrl updated successfully." 
-        $Success = $true 
-    } catch { 
-        Write-Warning "Failed to set Web URLs: $($_.Exception.Message)" 
-    }
+            Write-Output "✓ Initialization completed."
+        } catch {
+            Write-Warning "Failed to initialize server: $($_.Exception.Message)"
+        }
+    } 
 
-    # 6. Restart Service to Apply Bindings
+    # 6. Restart Target Service to Apply Bindings
     if ($Success) { 
-        Write-Output "Restarting SQLServerReportingServices service to apply bindings..." 
-        Restart-Service -Name 'SQLServerReportingServices' -Force 
-        Write-Output "✓ Service restarted successfully." 
+        $TargetService = $Config.ServiceName
+        if (-not $TargetService) { $TargetService = 'SQLServerReportingServices' } # Fallback
+
+        Write-Output "Restarting '$TargetService' service to apply bindings..." 
+        try {
+            Restart-Service -Name $TargetService -Force -ErrorAction Stop
+            Write-Output "✓ Service restarted successfully." 
+        } catch {
+            Write-Warning "Failed to restart service '$TargetService'. You may need to restart it manually. Error: $($_.Exception.Message)"
+        }
     }
-}
-catch { 
-    Write-Error "Failed to connect or process SSRS configuration: $($_.Exception.Message)" 
-    Write-Output "Please verify the WMI namespace '$AdminNs' is correct on this server."
 }
 
 # Finalize Task Success
 if ($EventRecordId) { Set-Content -Path $StateFile -Value $EventRecordId -Force }
-Write-Output "`nSSRS certificate auto-renewal and rebind processing completed."
+Write-Output "`nUniversal SSRS certificate auto-renewal and rebind processing completed."
