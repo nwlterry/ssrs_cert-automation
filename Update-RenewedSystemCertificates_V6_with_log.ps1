@@ -31,35 +31,40 @@ if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
 function Write-Log {
     Param(
         [Parameter(Mandatory=$true)][String]$Message,
-        [ValidateSet('Info', 'Warning', 'Error')][String]$Level = 'Info',
-        [switch]$IsDebugMessage
+        [ValidateSet('Info', 'Warning', 'Error', 'Debug')][String]$Level = 'Info'
     )
-    if ($IsDebugMessage -and -not $DebugMode) { return }
 
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogLine = "[$Timestamp] [$Level] $Message"
     
-    if ($Level -eq 'Error') { Write-Host $LogLine -ForegroundColor Red }
-    elseif ($Level -eq 'Warning') { Write-Host $LogLine -ForegroundColor Yellow }
-    else { Write-Host $LogLine -ForegroundColor Cyan }
+    # 1. Console Output (Only print Debug messages to console if DebugMode is switched on)
+    if ($Level -ne 'Debug' -or $DebugMode) {
+        if ($Level -eq 'Error') { Write-Host $LogLine -ForegroundColor Red }
+        elseif ($Level -eq 'Warning') { Write-Host $LogLine -ForegroundColor Yellow }
+        elseif ($Level -eq 'Debug') { Write-Host $LogLine -ForegroundColor Gray }
+        else { Write-Host $LogLine -ForegroundColor Cyan }
+    }
 
+    # 2. File Log (Always write everything, including Debug, to keep a full trace history)
     $LogLine | Out-File -FilePath $LogFilePath -Append -Encoding UTF8
 
-    if (-not $IsDebugMessage) {
+    # 3. Windows Event Log (Only Info, Warning, Error - Keeps Event Viewer clean)
+    if ($Level -ne 'Debug') {
         $EntryType = switch ($Level) { 'Info' { 'Information' }; 'Warning' { 'Warning' }; 'Error' { 'Error' } }
         $EventID = switch ($Level) { 'Info' { 1000 }; 'Warning' { 1001 }; 'Error' { 1002 } }
         try { Write-EventLog -LogName 'Application' -Source $EventSource -EntryType $EntryType -EventId $EventID -Message $Message -ErrorAction SilentlyContinue } catch {}
     }
 }
 
-Write-Log "Starting SSRS Certificate Rebind Process (CN Only). EventRecordId: $EventRecordId"
+if ($DebugMode) { Write-Log "=== DEBUG MODE ENABLED ===" -Level Debug }
+Write-Log "Starting SSRS Certificate Rebind Process (CN Only). EventRecordId: $EventRecordId" -Level Debug
 
 # 1. Duplicate Execution Prevention
 $StateFile = Join-Path $LogPath "LastProcessedEventRecordId.txt"
 if ($EventRecordId) { 
     $LastId = if (Test-Path $StateFile) { Get-Content $StateFile -EA SilentlyContinue } else { 0 } 
     if ($EventRecordId -le $LastId) {  
-        Write-Log "Event $EventRecordId already processed. Exiting." -IsDebugMessage
+        Write-Log "Event $EventRecordId already processed. Exiting." -Level Debug
         return  
     }
 }
@@ -73,7 +78,7 @@ if (-not $NewCertificate) {
     return
 }
 
-Write-Log "New Cert Subject: $($NewCertificate.Subject)" -IsDebugMessage
+Write-Log "New Cert Subject: $($NewCertificate.Subject)" -Level Debug
 
 # 2. Extract ONLY the Common Name (CN)
 $DnsNames = @()
@@ -83,11 +88,13 @@ if ($NewCertificate.Subject -match 'CN=([^,]+)') {
     Write-Log "Could not extract CN from subject: $($NewCertificate.Subject)" -Level Error
     return
 }
-Write-Log "Name for Binding: $($DnsNames[0])" -IsDebugMessage
+
+# This will log to Event Viewer
+Write-Log "Applying new certificate for Common Name: $($DnsNames[0])" -Level Info
 
 # 3. Verify Certificate Template Match
 if ($ExpectedTemplateName) {
-    Write-Log "Verifying Template. Expecting: '$ExpectedTemplateName'" -IsDebugMessage
+    Write-Log "Verifying Template. Expecting: '$ExpectedTemplateName'" -Level Debug
     $certTemplateExtension = $NewCertificate.Extensions | Where-Object { $_.Oid.Value -eq '1.3.6.1.4.1.311.21.7' }
     
     if (-not $certTemplateExtension) { Write-Log "No Template Info found. Skipping." -Level Warning; return }
@@ -129,7 +136,7 @@ if (-not $SsrsConfigs) { Write-Log "No SSRS/PBIRS instances found." -Level Error
 # 5. Process Instances
 $Port = 443; $SystemLocale = Get-Culture 
 foreach ($Config in $SsrsConfigs) {
-    Write-Log "Processing Instance: $($Config.InstanceName)"
+    Write-Log "Processing Instance: $($Config.InstanceName)" -Level Debug
     $Success = $false
 
     foreach ($App in @('ReportServerWebService', 'ReportServerWebApp')) { 
@@ -137,31 +144,45 @@ foreach ($Config in $SsrsConfigs) {
             $Url = "https://$Name`:$Port" 
             try { 
                 $Result = $Config | Invoke-CimMethod -MethodName ReserveURL -Arguments @{ Application = $App; UrlString = $Url; Lcid = $SystemLocale.LCID } -EA Stop 
-                if ($Result.HRESULT -eq 0 -or $Result.HRESULT -eq -2147220932) { $Success = $true }
+                if ($Result.HRESULT -eq 0) { 
+                    Write-Log "Successfully reserved URL: $Url" -Level Info
+                    $Success = $true 
+                }
+                elseif ($Result.HRESULT -eq -2147220932) { 
+                    Write-Log "URL already reserved: $Url" -Level Debug 
+                    $Success = $true 
+                }
+                else { Write-Log "ReserveURL $Url → HRESULT: $($Result.HRESULT)" -Level Warning }
             } catch { Write-Log "ReserveURL failed for $Url : $($_.Exception.Message)" -Level Warning } 
         }
 
         if ($OldCertHash) {
-            try { $Config | Invoke-CimMethod -MethodName RemoveSSLCertificateBinding -Arguments @{ Application = $App; CertificateHash = $OldCertHash.ToLower(); IPAddress = '0.0.0.0'; Port = $Port; Lcid = $SystemLocale.LCID } -EA Stop | Out-Null
-            } catch { Write-Log "RemoveSSLCertificateBinding ($App): No old binding found/removal failed." -IsDebugMessage }
+            try { 
+                $Result = $Config | Invoke-CimMethod -MethodName RemoveSSLCertificateBinding -Arguments @{ Application = $App; CertificateHash = $OldCertHash.ToLower(); IPAddress = '0.0.0.0'; Port = $Port; Lcid = $SystemLocale.LCID } -EA Stop 
+                Write-Log "Removed Old SSL Binding for $App" -Level Debug
+            } catch { Write-Log "RemoveSSLCertificateBinding ($App): No old binding found or removal failed." -Level Debug }
         }
 
         try { 
             $Result = $Config | Invoke-CimMethod -MethodName CreateSSLCertificateBinding -Arguments @{ Application = $App; CertificateHash = $NewCertHash.ToLower(); IPAddress = '0.0.0.0'; Port = $Port; Lcid = $SystemLocale.LCID } -EA Stop 
-            if ($Result.HRESULT -eq 0) { $Success = $true; Write-Log "Successfully bound new cert to $App" } 
+            if ($Result.HRESULT -eq 0) { 
+                $Success = $true
+                Write-Log "Successfully bound new certificate to $App" -Level Info
+            } 
+            else { Write-Log "CreateSSLCertificateBinding ($App) returned HRESULT: $($Result.HRESULT)" -Level Warning }
         } catch { Write-Log "CreateSSLCertificateBinding failed: $($_.Exception.Message)" -Level Error } 
     }
 
-    if (-not $Config.IsInitialized) { try { $Config | Invoke-CimMethod -MethodName InitializeReportServer -Arguments @{ InstallationID = $Config.InstallationID } | Out-Null } catch {} } 
+    if (-not $Config.IsInitialized) { try { Write-Log "Initializing Report Server..." -Level Debug; $Config | Invoke-CimMethod -MethodName InitializeReportServer -Arguments @{ InstallationID = $Config.InstallationID } | Out-Null } catch {} } 
 
     if ($Success) { 
         $TargetService = if ($Config.ServiceName) { $Config.ServiceName } else { 'SQLServerReportingServices' }
         try {
             Restart-Service -Name $TargetService -Force -EA Stop
-            Write-Log "Successfully restarted service: $TargetService" 
+            Write-Log "Successfully restarted service: $TargetService" -Level Info
         } catch { Write-Log "Failed to restart service '$TargetService'. Error: $($_.Exception.Message)" -Level Warning }
     }
 }
 
 if ($EventRecordId) { Set-Content -Path $StateFile -Value $EventRecordId -Force }
-Write-Log "Processing completed successfully."
+Write-Log "SSRS Certificate Auto-Rebind completed successfully." -Level Info
