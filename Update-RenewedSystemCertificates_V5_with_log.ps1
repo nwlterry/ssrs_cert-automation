@@ -153,7 +153,7 @@ foreach ($Config in $SsrsConfigs) {
                     $Success = $true 
                 }
                 elseif ($Result.HRESULT -eq -2147220932) { 
-                    Write-Log "URL already reserved: $Url" -Level Debug 
+                    Write-Log "URL already reserved: $Url" -Level Info # Changed to Info for Event Viewer logging
                     $Success = $true 
                 }
                 else { Write-Log "ReserveURL $Url → HRESULT: $($Result.HRESULT)" -Level Warning }
