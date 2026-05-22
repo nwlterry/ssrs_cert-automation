@@ -160,12 +160,22 @@ foreach ($Config in $SsrsConfigs) {
             } catch { Write-Log "ReserveURL failed for $Url : $($_.Exception.Message)" -Level Warning } 
         }
 
+        # WMI Removal (If OldCertHash was provided)
         if ($OldCertHash) {
             try { 
                 $Result = $Config | Invoke-CimMethod -MethodName RemoveSSLCertificateBinding -Arguments @{ Application = $App; CertificateHash = $OldCertHash.ToLower(); IPAddress = '0.0.0.0'; Port = $Port; Lcid = $SystemLocale.LCID } -EA Stop 
-                Write-Log "Removed Old SSL Binding for $App" -Level Debug
-            } catch { Write-Log "RemoveSSLCertificateBinding ($App): No old binding found or removal failed." -Level Debug }
+                Write-Log "Removed Old SSL Binding for $App via WMI" -Level Debug
+            } catch { Write-Log "RemoveSSLCertificateBinding ($App): No old binding found or WMI removal failed." -Level Debug }
         }
+
+        # NETSH FALLBACK: Forcefully wipe any existing binding on 0.0.0.0:443 to ensure CreateSSLCertificateBinding succeeds
+        try {
+            $NetshOutput = netsh http show sslcert ipport="0.0.0.0:$Port" | Out-String
+            if ($NetshOutput -match "0\.0\.0\.0:$Port") {
+                Write-Log "Existing binding detected on 0.0.0.0:$Port. Force clearing via netsh..." -Level Debug
+                netsh http delete sslcert ipport="0.0.0.0:$Port" | Out-Null
+            }
+        } catch {}
 
         try { 
             $Result = $Config | Invoke-CimMethod -MethodName CreateSSLCertificateBinding -Arguments @{ Application = $App; CertificateHash = $NewCertHash.ToLower(); IPAddress = '0.0.0.0'; Port = $Port; Lcid = $SystemLocale.LCID } -EA Stop 
