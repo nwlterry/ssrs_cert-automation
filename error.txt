@@ -1,0 +1,2 @@
+CommandInvocation(Update-RenewedSystemCertificates_cnlog.ps1): "Update-RenewedSystemCertificates_cnlog.ps1"
+TerminatingError(Update-RenewedSystemCertificates_cnlog.ps1): "Cannot process argument transformation on parameter 'EventRecordId'. Cannot convert value "$(EventRecordId)" to type "System.Int32". Error: "Input string was not in a correct format.""
